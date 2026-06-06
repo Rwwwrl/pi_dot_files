@@ -1,0 +1,17 @@
+{
+  "lastChangelogVersion": "0.78.1",
+  "defaultProvider": "openai-codex",
+  "defaultModel": "gpt-5.5",
+  "defaultThinkingLevel": "high",
+  "compaction": {
+    "enabled": false
+  },
+  "terminal": {
+    "showImages": false
+  },
+  "editorPaddingX": 1,
+  "showHardwareCursor": true,
+  "hideThinkingBlock": false,
+  "quietStartup": true,
+  "enableInstallTelemetry": false
+}
