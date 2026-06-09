@@ -1,5 +1,5 @@
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { classifyBashCommand } from "../auto/safety.ts";
+import { classifyNormalBashCommand } from "./policies.ts";
 
 function truncateApprovalText(value: string, maxLength = 4000): string {
 	if (value.length <= maxLength) return value;
@@ -41,10 +41,18 @@ export async function approveNormalToolCall(
 }
 
 export async function approveNormalBashCommand(ctx: ExtensionContext, command: string): Promise<boolean> {
-	const classification = classifyBashCommand(command);
+	const classification = classifyNormalBashCommand(command);
 	return requestNormalApproval(
 		ctx,
 		"Approve shell command?",
 		`Normal mode requires your explicit approval before this shell command can run.\n\nReason: ${classification.reason}\n\nCommand:\n${command}`,
+	);
+}
+
+export async function approveExecutionForcePushWithLease(ctx: ExtensionContext, command: string): Promise<boolean> {
+	if (!ctx.hasUI) return false;
+	return ctx.ui.confirm(
+		"Approve force-push with lease?",
+		`This command rewrites remote history. Only approve if you intentionally want to update the remote branch to the current rewritten local history.\n\nCommand:\n${command}`,
 	);
 }

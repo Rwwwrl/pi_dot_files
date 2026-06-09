@@ -25,5 +25,5 @@
       ]
     }
   },
-  "include": ["*.ts", "modes/**/*.ts", "tests/**/*.ts"]
+  "include": ["*.ts", "modes/**/*.ts", "subagents/**/*.ts", "tests/**/*.ts"]
 }

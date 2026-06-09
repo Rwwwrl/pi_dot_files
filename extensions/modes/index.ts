@@ -2,39 +2,50 @@
  * Modes Extension
  *
  * Claude Code-style modes for pi:
- * - normal: safe work with approval required for changes
- * - plan: read-only ordered implementation planning
- * - grooming: read-only brainstorming and feature-shaping
- * - auto: full tool access
+ * - normal: no intention wrapper; allowlisted/research commands run directly; changes require approval
+ * - research: read-only code understanding and review through the research gate
+ * - plan: research-capable implementation planning with persisted plan artifacts
+ * - brainstorming: research-capable brainstorming and feature-shaping
+ * - auto: execution mode protected by the execution gate
  */
 
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import type { AssistantMessage, TextContent } from "@earendil-works/pi-ai";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { classifyBashCommand, classifyToolCall, isSafeCommand } from "./auto/safety.ts";
-import { reviewToolCallWithAgent } from "./auto/review.ts";
 import { buildAutoModePrompt } from "./auto/prompts.ts";
-import { buildGroomingModePrompt } from "./grooming/prompts.ts";
-import { approveNormalBashCommand, approveNormalToolCall } from "./normal/approval.ts";
+import { buildBrainstormingModePrompt } from "./brainstorming/prompts.ts";
+import { reviewToolCallWithExecutionGate, reviewToolCallWithResearchGate } from "./ai-reviewer.ts";
+import {
+	classifyExecutionBashCommand,
+	classifyExecutionToolCall,
+	classifyNormalBashCommand,
+	classifyResearchBashCommand,
+	classifyResearchToolCall,
+	isGitPushForceWithLeaseCommand,
+} from "./policies.ts";
+import { approveExecutionForcePushWithLease, approveNormalBashCommand, approveNormalToolCall } from "./views.ts";
 import { buildNormalModePrompt } from "./normal/prompts.ts";
-import { savePlanArtifact, shouldPersistPlanText } from "./plan/artifacts.ts";
-import { buildPlanExecuteMessage, buildPlanExecutionPrompt } from "./plan/execution.ts";
+import { savePlanArtifact, shouldPersistPlanText } from "./repositories.ts";
+import { buildPlanExecuteMessage } from "./services.ts";
 import { buildPlanModePrompt } from "./plan/prompts.ts";
 import { registerPlanQuestionTool } from "./plan/tools.ts";
+import { buildResearchModePrompt } from "./research/prompts.ts";
+import { setCurrentMode, type Mode } from "./state.ts";
 
-type Mode = "normal" | "plan" | "grooming" | "auto";
-
-const MODE_ORDER: Mode[] = ["normal", "plan", "grooming", "auto"];
-const READ_ONLY_TOOLS = new Set([
-	"read",
+const MODE_ORDER: Mode[] = ["normal", "research", "plan", "brainstorming", "auto"];
+const READ_ONLY_MODE_TOOL_ALLOWLIST = new Set([
 	"bash",
+	"read",
 	"grep",
 	"find",
 	"ls",
 	"plan_question",
-	"questionnaire",
 	"question",
+	"questionnaire",
 	"ask_question",
+	"web_research",
+	"web_fetch",
+	"subagents",
 ]);
 const HIDDEN_CUSTOM_MESSAGE_TYPES = new Set([
 	// Compatibility: hide context-injection messages from older versions of this extension.
@@ -82,34 +93,48 @@ function nextMode(mode: Mode): Mode {
 	return MODE_ORDER[(index + 1) % MODE_ORDER.length];
 }
 
-function isReadOnlyMode(mode: Mode): boolean {
-	return mode === "plan" || mode === "grooming";
-}
-
 function modeStatusColor(mode: Mode): "success" | "muted" | "warning" {
 	return mode === "auto" ? "success" : mode === "normal" ? "muted" : "warning";
 }
 
+async function reviewResearchToolCall(
+	ctx: ExtensionContext,
+	toolName: string,
+	input: Record<string, unknown>,
+	reason: string,
+): Promise<{ allow: boolean; reason: string }> {
+	return reviewToolCallWithResearchGate(ctx, toolName, input, reason);
+}
+
+function canUseSubagents(mode: Mode): boolean {
+	return mode === "research" || mode === "plan" || mode === "brainstorming";
+}
+
 export default function modesExtension(pi: ExtensionAPI): void {
 	let currentMode: Mode = "normal";
-	let executionMode = false;
 	let activePlanFile: string | undefined;
 	let baselineActiveTools: Set<string> | undefined;
 
-	pi.registerFlag("plan", {
-		description: "Start in plan mode (read-only ordered planning)",
+	pi.registerFlag("research", {
+		description: "Start in research mode (read-only code understanding)",
 		type: "boolean",
 		default: false,
 	});
 
-	pi.registerFlag("grooming", {
-		description: "Start in grooming mode (read-only brainstorming)",
+	pi.registerFlag("plan", {
+		description: "Start in plan mode (research-capable ordered planning)",
+		type: "boolean",
+		default: false,
+	});
+
+	pi.registerFlag("brainstorming", {
+		description: "Start in brainstorming mode (research-capable brainstorming)",
 		type: "boolean",
 		default: false,
 	});
 
 	pi.registerFlag("automode", {
-		description: "Start in auto mode (full tool access)",
+		description: "Start in auto mode (execution gate)",
 		type: "boolean",
 		default: false,
 	});
@@ -121,16 +146,33 @@ export default function modesExtension(pi: ExtensionAPI): void {
 		return baselineActiveTools;
 	}
 
-	function getAvailableTools(allowedTools?: Set<string>): string[] {
+	function getAvailableTools(): string[] {
 		const baseline = getBaselineActiveTools();
+		const modeAllowlist =
+			currentMode === "research" || currentMode === "plan" || currentMode === "brainstorming"
+				? READ_ONLY_MODE_TOOL_ALLOWLIST
+				: undefined;
 		return pi
 			.getAllTools()
 			.map((tool) => tool.name)
-			.filter((tool) => baseline.has(tool) && (!allowedTools || allowedTools.has(tool)));
+			.filter((tool) => {
+				if (!baseline.has(tool)) return false;
+				if (tool === "subagents" && !canUseSubagents(currentMode)) return false;
+				return !modeAllowlist || modeAllowlist.has(tool);
+			});
+	}
+
+	function restoreBaselineTools(toolNames: string[]): void {
+		const available = new Set(pi.getAllTools().map((tool) => tool.name));
+		// Preserve the session's original active-tool baseline, but drop tools that no longer exist after reloads.
+		baselineActiveTools = new Set(toolNames.filter((toolName) => available.has(toolName)));
+		// Allow this extension's own tools to become available in existing sessions after /reload without enabling every new tool.
+		if (available.has("plan_question")) baselineActiveTools.add("plan_question");
+		if (available.has("subagents")) baselineActiveTools.add("subagents");
 	}
 
 	function applyTools(): void {
-		pi.setActiveTools(isReadOnlyMode(currentMode) ? getAvailableTools(READ_ONLY_TOOLS) : getAvailableTools());
+		pi.setActiveTools(getAvailableTools());
 	}
 
 	function updateStatus(ctx: ExtensionContext): void {
@@ -140,7 +182,6 @@ export default function modesExtension(pi: ExtensionAPI): void {
 	function persistState(): void {
 		pi.appendEntry("modes", {
 			mode: currentMode,
-			executing: executionMode,
 			planFile: activePlanFile,
 			baselineTools: [...getBaselineActiveTools()],
 		});
@@ -148,11 +189,8 @@ export default function modesExtension(pi: ExtensionAPI): void {
 
 	function setMode(mode: Mode, ctx: ExtensionContext, options: { persist: boolean }): void {
 		currentMode = mode;
-
-		if (mode !== "auto") {
-			executionMode = false;
-		}
-		// Keep the active plan file when switching modes so grooming/plan can refine it.
+		setCurrentMode(mode);
+		// Keep the active plan file when switching modes so brainstorming/plan can refine it; research leaves it unchanged.
 
 		applyTools();
 		updateStatus(ctx);
@@ -167,7 +205,7 @@ export default function modesExtension(pi: ExtensionAPI): void {
 	}
 
 	pi.registerCommand("mode", {
-		description: "Show or switch mode: normal, plan, grooming, auto",
+		description: "Show or switch mode: normal, research, plan, brainstorming, auto",
 		handler: async (args, ctx) => {
 			const requestedMode = normalizeMode(args);
 			if (!requestedMode) {
@@ -179,97 +217,135 @@ export default function modesExtension(pi: ExtensionAPI): void {
 	});
 
 	pi.registerCommand("normal", {
-		description: "Switch to normal mode (safe commands direct; changes require approval)",
+		description: "Switch to normal mode (allowlisted/research commands direct; changes require approval)",
 		handler: async (_args, ctx) => setMode("normal", ctx, { persist: true }),
 	});
 
+	pi.registerCommand("research", {
+		description: "Switch to research mode (read-only code understanding)",
+		handler: async (_args, ctx) => setMode("research", ctx, { persist: true }),
+	});
+
 	pi.registerCommand("plan", {
-		description: "Switch to plan mode (read-only ordered planning)",
+		description: "Switch to plan mode (research-capable ordered planning)",
 		handler: async (_args, ctx) => setMode("plan", ctx, { persist: true }),
 	});
 
-	pi.registerCommand("grooming", {
-		description: "Switch to grooming mode (read-only brainstorming)",
-		handler: async (_args, ctx) => setMode("grooming", ctx, { persist: true }),
+	pi.registerCommand("brainstorming", {
+		description: "Switch to brainstorming mode (research-capable brainstorming)",
+		handler: async (_args, ctx) => setMode("brainstorming", ctx, { persist: true }),
 	});
 
 	pi.registerCommand("auto", {
-		description: "Switch to auto mode (full tool access)",
+		description: "Switch to auto mode (execution gate)",
 		handler: async (_args, ctx) => setMode("auto", ctx, { persist: true }),
 	});
 
 	pi.registerShortcut("shift+tab", {
-		description: "Cycle mode: normal → plan → grooming → auto",
+		description: "Cycle mode: normal → research → plan → brainstorming → auto",
 		handler: async (ctx) => cycleMode(ctx),
 	});
 
 	pi.on("tool_call", async (event, ctx) => {
 		const input = event.input as Record<string, unknown>;
-		const classification = classifyToolCall(event.toolName, input, ctx.cwd);
 
 		if (currentMode === "auto") {
+			const classification = classifyExecutionToolCall(event.toolName, input, ctx.cwd);
 			if (classification.decision === "allow") return undefined;
 			if (classification.decision === "deny") {
-				return { block: true, reason: `Automode blocked ${event.toolName}: ${classification.reason}` };
+				return { block: true, reason: `execution gate blocked ${event.toolName}: ${classification.reason}` };
 			}
 
-			const review = await reviewToolCallWithAgent(ctx, event.toolName, input, classification.reason);
+			const command = event.toolName === "bash" && typeof input.command === "string" ? input.command : "";
+			if (isGitPushForceWithLeaseCommand(command)) {
+				const approved = await approveExecutionForcePushWithLease(ctx, command);
+				if (approved) return undefined;
+				return { block: true, reason: `execution gate requires explicit user approval before git push --force-with-lease.\nCommand: ${command}` };
+			}
+
+			const review = await reviewToolCallWithExecutionGate(ctx, event.toolName, input, classification.reason);
 			if (review.allow) return undefined;
-			return { block: true, reason: `Automode safety review blocked ${event.toolName}: ${review.reason}` };
+			return { block: true, reason: `execution-gate safety review blocked ${event.toolName}: ${review.reason}` };
 		}
 
 		if (currentMode === "normal") {
 			if (event.toolName === "bash") {
 				const command = typeof input.command === "string" ? input.command : "";
-				if (!command.trim() || isSafeCommand(command)) return undefined;
+				const classification = classifyNormalBashCommand(command);
+				if (classification.decision === "allow") return undefined;
+				if (classification.decision === "deny") {
+					return { block: true, reason: `normal mode blocked shell command: ${classification.reason}\nCommand: ${command}` };
+				}
 
 				const approved = await approveNormalBashCommand(ctx, command);
 				if (approved) return undefined;
 				return {
 					block: true,
-					reason: `normal mode requires explicit user approval for unsafe shell commands.\nCommand: ${command}`,
+					reason: `normal mode requires explicit user approval for this shell command.\nCommand: ${command}`,
 				};
 			}
 
-			if (READ_ONLY_TOOLS.has(event.toolName) && classification.decision !== "allow") {
+			if (event.toolName === "edit" || event.toolName === "write") {
 				const approved = await approveNormalToolCall(ctx, event.toolName, input);
 				if (approved) return undefined;
-				return {
-					block: true,
-					reason: `normal mode requires user approval before ${event.toolName}: ${classification.reason}`,
-				};
+				return { block: true, reason: `normal mode requires user approval before ${event.toolName}.` };
 			}
 
-			if (!READ_ONLY_TOOLS.has(event.toolName)) {
-				const approved = await approveNormalToolCall(ctx, event.toolName, input);
-				if (approved) return undefined;
-				return { block: true, reason: `normal mode requires user approval before running ${event.toolName}.` };
+			const classification = classifyResearchToolCall(event.toolName, input, ctx.cwd);
+			if (classification.decision === "allow") return undefined;
+			if (classification.decision === "deny") {
+				return { block: true, reason: `normal mode blocked ${event.toolName}: ${classification.reason}` };
 			}
 
-			return undefined;
+			const approved = await approveNormalToolCall(ctx, event.toolName, input);
+			if (approved) return undefined;
+			return { block: true, reason: `normal mode requires user approval before ${event.toolName}: ${classification.reason}` };
 		}
 
-		if (!READ_ONLY_TOOLS.has(event.toolName)) {
-			return { block: true, reason: `${currentMode} mode is read-only. Switch to auto mode to use ${event.toolName}.` };
-		}
-
-		if (classification.decision !== "allow") {
+		const classification = classifyResearchToolCall(event.toolName, input, ctx.cwd);
+		if (classification.decision === "allow") return undefined;
+		if (classification.decision === "deny") {
 			return { block: true, reason: `${currentMode} mode blocked ${event.toolName}: ${classification.reason}` };
 		}
-		return undefined;
+
+		const review = await reviewResearchToolCall(ctx, event.toolName, input, classification.reason);
+		if (review.allow) return undefined;
+		return { block: true, reason: `${currentMode} research-gate review blocked ${event.toolName}: ${review.reason}` };
 	});
 
 	pi.on("user_bash", async (event, ctx) => {
-		const classification = classifyBashCommand(event.command);
-		if (classification.decision === "allow") return undefined;
+		if (currentMode === "auto") {
+			const classification = classifyExecutionBashCommand(event.command);
+			if (classification.decision === "allow") return undefined;
+			if (classification.decision === "deny") {
+				return {
+					result: {
+						output: `execution gate blocked shell command: ${classification.reason}\nCommand: ${event.command}`,
+						exitCode: 1,
+						cancelled: false,
+						truncated: false,
+					},
+				};
+			}
 
-		if (currentMode === "normal") {
-			const approved = await approveNormalBashCommand(ctx, event.command);
-			if (approved) return undefined;
+			if (isGitPushForceWithLeaseCommand(event.command)) {
+				const approved = await approveExecutionForcePushWithLease(ctx, event.command);
+				if (approved) return undefined;
+				return {
+					result: {
+						output: `execution gate requires explicit user approval before git push --force-with-lease.\nCommand: ${event.command}`,
+						exitCode: 1,
+						cancelled: false,
+						truncated: false,
+					},
+				};
+			}
 
+			const review = await reviewToolCallWithExecutionGate(ctx, "bash", { command: event.command }, classification.reason);
+			if (review.allow) return undefined;
 			return {
 				result: {
-					output: `normal mode requires explicit user approval for unsafe shell commands.\nCommand: ${event.command}`,
+					output: `execution-gate safety review blocked shell command: ${review.reason}\nCommand: ${event.command}`,
 					exitCode: 1,
 					cancelled: false,
 					truncated: false,
@@ -277,7 +353,35 @@ export default function modesExtension(pi: ExtensionAPI): void {
 			};
 		}
 
-		if (currentMode !== "auto" || classification.decision === "deny") {
+		if (currentMode === "normal") {
+			const classification = classifyNormalBashCommand(event.command);
+			if (classification.decision === "allow") return undefined;
+			if (classification.decision === "deny") {
+				return {
+					result: {
+						output: `normal mode blocked shell command: ${classification.reason}\nCommand: ${event.command}`,
+						exitCode: 1,
+						cancelled: false,
+						truncated: false,
+					},
+				};
+			}
+
+			const approved = await approveNormalBashCommand(ctx, event.command);
+			if (approved) return undefined;
+			return {
+				result: {
+					output: `normal mode requires explicit user approval for this shell command.\nCommand: ${event.command}`,
+					exitCode: 1,
+					cancelled: false,
+					truncated: false,
+				},
+			};
+		}
+
+		const classification = classifyResearchBashCommand(event.command);
+		if (classification.decision === "allow") return undefined;
+		if (classification.decision === "deny") {
 			return {
 				result: {
 					output: `${currentMode} mode blocked shell command: ${classification.reason}\nCommand: ${event.command}`,
@@ -288,7 +392,16 @@ export default function modesExtension(pi: ExtensionAPI): void {
 			};
 		}
 
-		return undefined;
+		const review = await reviewResearchToolCall(ctx, "bash", { command: event.command }, classification.reason);
+		if (review.allow) return undefined;
+		return {
+			result: {
+				output: `${currentMode} research-gate review blocked shell command: ${review.reason}\nCommand: ${event.command}`,
+				exitCode: 1,
+				cancelled: false,
+				truncated: false,
+			},
+		};
 	});
 
 	pi.on("context", async (event) => {
@@ -305,28 +418,22 @@ export default function modesExtension(pi: ExtensionAPI): void {
 			return { systemPrompt: `${event.systemPrompt}\n\n${buildNormalModePrompt()}` };
 		}
 
-		if (currentMode === "grooming") {
-			return { systemPrompt: `${event.systemPrompt}\n\n${buildGroomingModePrompt(activePlanFile)}` };
+		if (currentMode === "research") {
+			return { systemPrompt: `${event.systemPrompt}\n\n${buildResearchModePrompt()}` };
+		}
+
+		if (currentMode === "brainstorming") {
+			return { systemPrompt: `${event.systemPrompt}\n\n${buildBrainstormingModePrompt(activePlanFile)}` };
 		}
 
 		if (currentMode === "plan") {
 			return { systemPrompt: `${event.systemPrompt}\n\n${buildPlanModePrompt(activePlanFile)}` };
 		}
 
-		if (executionMode) {
-			return { systemPrompt: `${event.systemPrompt}\n\n${buildPlanExecutionPrompt(activePlanFile)}` };
-		}
-
 		return { systemPrompt: `${event.systemPrompt}\n\n${buildAutoModePrompt()}` };
 	});
 
 	pi.on("agent_end", async (event, ctx) => {
-		if (executionMode) {
-			executionMode = false;
-			setMode("normal", ctx, { persist: true });
-			return;
-		}
-
 		if (currentMode !== "plan") return;
 
 		const lastAssistant = [...event.messages].reverse().find(isAssistantMessage);
@@ -359,28 +466,25 @@ export default function modesExtension(pi: ExtensionAPI): void {
 			"Execute the plan in auto mode",
 			"Stay in plan mode",
 			"Refine the plan",
-			"Switch to grooming mode",
+			"Switch to brainstorming mode",
 		]);
 
 		if (!choice) return;
 
 		if (choice === "Refine the plan") {
+			ctx.ui.setEditorText(`Refine ${activePlanFile ? `the plan in ${activePlanFile}` : "the current plan"}: `);
 			return;
 		}
 
 		if (choice?.startsWith("Execute")) {
-			currentMode = "auto";
-			executionMode = true;
-			applyTools();
-			updateStatus(ctx);
-			persistState();
+			setMode("auto", ctx, { persist: true });
 
 			pi.sendMessage(
 				{ customType: "mode-plan-execute", content: buildPlanExecuteMessage(activePlanFile), display: false },
 				{ triggerTurn: true },
 			);
-		} else if (choice === "Switch to grooming mode") {
-			setMode("grooming", ctx, { persist: true });
+		} else if (choice === "Switch to brainstorming mode") {
+			setMode("brainstorming", ctx, { persist: true });
 		}
 	});
 
@@ -389,28 +493,25 @@ export default function modesExtension(pi: ExtensionAPI): void {
 		const modeEntry = entries
 			.filter((entry: { type: string; customType?: string }) => entry.type === "custom" && entry.customType === "modes")
 			.pop() as
-			| { data?: { mode?: Mode; executing?: boolean; planFile?: string; baselineTools?: string[] } }
+			| { data?: { mode?: Mode; planFile?: string; baselineTools?: string[] } }
 			| undefined;
 
 		if (Array.isArray(modeEntry?.data?.baselineTools)) {
-			baselineActiveTools = new Set(modeEntry.data.baselineTools);
+			restoreBaselineTools(modeEntry.data.baselineTools);
 		} else {
 			baselineActiveTools = new Set(pi.getActiveTools());
 		}
 
 		if (modeEntry?.data?.mode && MODE_ORDER.includes(modeEntry.data.mode)) {
 			currentMode = modeEntry.data.mode;
-			executionMode = modeEntry.data.executing ?? false;
 			activePlanFile = modeEntry.data.planFile;
 		}
 
+		if (pi.getFlag("research") === true) currentMode = "research";
 		if (pi.getFlag("plan") === true) currentMode = "plan";
-		if (pi.getFlag("grooming") === true) currentMode = "grooming";
+		if (pi.getFlag("brainstorming") === true) currentMode = "brainstorming";
 		if (pi.getFlag("automode") === true) currentMode = "auto";
-
-		if (currentMode !== "auto") {
-			executionMode = false;
-		}
+		setCurrentMode(currentMode);
 
 		applyTools();
 		updateStatus(ctx);

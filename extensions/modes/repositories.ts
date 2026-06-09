@@ -35,53 +35,6 @@ export function shouldPersistPlanText(text: string): boolean {
 	return /\bPlan:\s*\n/i.test(text) || (/^#\s+.+$/m.test(text) && /^\s*\d+[.)]\s+/m.test(text));
 }
 
-export function extractNumberedSteps(text: string): string[] {
-	return [...text.matchAll(/^\s*\d+[.)]\s+(.+)$/gm)].map((match) => match[1].replace(/\s+/g, " ").trim());
-}
-
-export function summarizePlanChanges(previous: string, next: string): string[] {
-	if (previous.trim().length === 0) {
-		const steps = extractNumberedSteps(next).length;
-		return [`Created a new plan${steps > 0 ? ` with ${steps} step${steps === 1 ? "" : "s"}` : ""}.`];
-	}
-
-	if (previous.trim() === next.trim()) {
-		return ["No content changes detected; the plan file already matched the latest plan."];
-	}
-
-	const changes: string[] = [];
-	const previousTitle = extractPlanTitle(previous);
-	const nextTitle = extractPlanTitle(next);
-	if (previousTitle && nextTitle && previousTitle !== nextTitle) {
-		changes.push(`Renamed the plan from "${previousTitle}" to "${nextTitle}".`);
-	}
-
-	const previousSteps = extractNumberedSteps(previous);
-	const nextSteps = extractNumberedSteps(next);
-	const maxSteps = Math.max(previousSteps.length, nextSteps.length);
-	for (let index = 0; index < maxSteps; index++) {
-		const before = previousSteps[index];
-		const after = nextSteps[index];
-		if (before && after && before !== after) {
-			changes.push(`Updated step ${index + 1}: "${before}" → "${after}".`);
-		} else if (!before && after) {
-			changes.push(`Added step ${index + 1}: "${after}".`);
-		} else if (before && !after) {
-			changes.push(`Removed step ${index + 1}: "${before}".`);
-		}
-	}
-
-	if (changes.length === 0) {
-		changes.push("Updated supporting details, notes, risks, or formatting without changing the numbered steps.");
-	}
-
-	const maxChangeBullets = 8;
-	if (changes.length > maxChangeBullets) {
-		return [...changes.slice(0, maxChangeBullets), `And ${changes.length - maxChangeBullets} more change(s).`];
-	}
-	return changes;
-}
-
 export function isSafePlanFile(ctx: ExtensionContext, planFile: string): boolean {
 	const plansDir = resolve(ctx.cwd, "plans");
 	const absolutePath = resolve(ctx.cwd, planFile);
@@ -106,7 +59,7 @@ export async function savePlanArtifact(
 	activePlanFile: string | undefined,
 	planText: string,
 	userPrompt: string,
-): Promise<{ file: string; created: boolean; changes: string[] }> {
+): Promise<{ file: string; created: boolean }> {
 	await mkdir(resolve(ctx.cwd, "plans"), { recursive: true });
 
 	const planFile =
@@ -128,6 +81,5 @@ export async function savePlanArtifact(
 	return {
 		file: planFile,
 		created: previous.trim().length === 0,
-		changes: summarizePlanChanges(previous, next),
 	};
 }

@@ -1,11 +1,21 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
-import { Container, Editor, type EditorTheme, Key, matchesKey, Text, truncateToWidth } from "@earendil-works/pi-tui";
+import {
+	Container,
+	Editor,
+	type EditorTheme,
+	Key,
+	matchesKey,
+	Text,
+	truncateToWidth,
+	visibleWidth,
+	wrapTextWithAnsi,
+} from "@earendil-works/pi-tui";
 
 const PLAN_QUESTION_PARAMETERS = {
 	type: "object",
 	properties: {
-		question: { type: "string", description: "The planning question to ask." },
+		question: { type: "string", description: "The question to ask." },
 		options: {
 			type: "array",
 			description: "Concrete answer choices.",
@@ -39,12 +49,13 @@ interface PlanQuestionParams {
 export function registerPlanQuestionTool(pi: ExtensionAPI): void {
 	pi.registerTool({
 		name: "plan_question",
-		label: "Plan Question",
+		label: "Ask Question",
 		description:
-			"Ask the user a planning clarification with concrete choices, benefits, caveats, and an optional recommendation before writing a plan.",
-		promptSnippet: "Ask a choice-based planning clarification before emitting a plan",
+			"Ask the user an interactive question with concrete choices, benefits, caveats, and an optional recommendation.",
+		promptSnippet: "Ask a choice-based user question before proceeding when input is needed",
 		promptGuidelines: [
-			"Use plan_question in plan mode when an answer materially affects the plan; do not write the plan until the answer is known.",
+			"Use plan_question in any mode where it is available when you need a user decision, confirmation, preference, or missing input before proceeding.",
+			"Do not ask blocking questions only in plain prose unless plan_question or the UI is unavailable.",
 			"For plan_question options, include benefits, caveats, and mark the recommended option when appropriate.",
 			"plan_question always includes an Other/custom option with inline typing, so do not add your own custom option.",
 		],
@@ -53,7 +64,7 @@ export function registerPlanQuestionTool(pi: ExtensionAPI): void {
 			const typed = params as unknown as PlanQuestionParams;
 			if (!ctx.hasUI) {
 				return {
-					content: [{ type: "text", text: "UI is not available to ask the planning question." }],
+					content: [{ type: "text", text: "UI is not available to ask the question." }],
 					details: { question: typed.question, answer: null },
 				};
 			}
@@ -64,7 +75,7 @@ export function registerPlanQuestionTool(pi: ExtensionAPI): void {
 				const selected = await ctx.ui.select(typed.question, labels);
 				if (!selected) {
 					return {
-						content: [{ type: "text", text: "User cancelled the planning question." }],
+						content: [{ type: "text", text: "User cancelled the question." }],
 						details: { question: typed.question, answer: null },
 					};
 				}
@@ -74,18 +85,18 @@ export function registerPlanQuestionTool(pi: ExtensionAPI): void {
 					const customAnswer = (await ctx.ui.input("Other/custom answer", "Type a different answer"))?.trim();
 					if (!customAnswer) {
 						return {
-							content: [{ type: "text", text: "User cancelled the planning question." }],
+							content: [{ type: "text", text: "User cancelled the question." }],
 							details: { question: typed.question, answer: null },
 						};
 					}
 					return {
-						content: [{ type: "text", text: `User answered planning question: ${customAnswer}` }],
+						content: [{ type: "text", text: `User answered question: ${customAnswer}` }],
 						details: { question: typed.question, answer: customAnswer, wasCustom: true },
 					};
 				}
 
 				return {
-					content: [{ type: "text", text: `User answered planning question: ${selected}` }],
+					content: [{ type: "text", text: `User answered question: ${selected}` }],
 					details: { question: typed.question, answer: selected, wasCustom: false },
 				};
 			}
@@ -94,6 +105,7 @@ export function registerPlanQuestionTool(pi: ExtensionAPI): void {
 				let optionIndex = 0;
 				let inputMode = false;
 				let cachedLines: string[] | undefined;
+				let cachedWidth: number | undefined;
 
 				const editorTheme: EditorTheme = {
 					borderColor: (text) => theme.fg("accent", text),
@@ -109,6 +121,7 @@ export function registerPlanQuestionTool(pi: ExtensionAPI): void {
 
 				function refresh(): void {
 					cachedLines = undefined;
+					cachedWidth = undefined;
 					tui.requestRender();
 				}
 
@@ -168,53 +181,64 @@ export function registerPlanQuestionTool(pi: ExtensionAPI): void {
 						}
 					},
 					render(width: number): string[] {
-						if (cachedLines) return cachedLines;
+						if (cachedLines && cachedWidth === width) return cachedLines;
 
 						const lines: string[] = [];
-						const add = (line: string) => lines.push(truncateToWidth(line, width));
+						const addRaw = (line: string) => lines.push(truncateToWidth(line, width, ""));
+						const addWrapped = (text: string, prefix = "", continuationPrefix = prefix) => {
+							const maxPrefixWidth = Math.max(visibleWidth(prefix), visibleWidth(continuationPrefix));
+							const wrapped = wrapTextWithAnsi(text, Math.max(1, width - maxPrefixWidth));
+							for (let lineIndex = 0; lineIndex < wrapped.length; lineIndex++) {
+								const currentPrefix = lineIndex === 0 ? prefix : continuationPrefix;
+								lines.push(truncateToWidth(`${currentPrefix}${wrapped[lineIndex]}`, width, ""));
+							}
+						};
 
-						add(theme.fg("accent", typed.question));
+						addWrapped(theme.fg("accent", typed.question));
 						lines.push("");
 						for (let index = 0; index < options.length; index++) {
 							const option = options[index];
 							const selected = index === optionIndex;
 							const prefix = selected ? theme.fg("accent", "→ ") : "  ";
 							const color = selected ? "accent" : "text";
-							add(`${prefix}${theme.fg(color, `${index + 1}. ${option.label}`)}${inputMode && selected ? " ✎" : ""}`);
-							add(`   ${theme.fg("muted", option.description)}`);
+							const editSuffix = inputMode && selected ? " ✎" : "";
+							addWrapped(theme.fg(color, `${index + 1}. ${option.label}${editSuffix}`), prefix, "  ");
+							addWrapped(theme.fg("muted", option.description), "   ", "   ");
 						}
 
 						if (inputMode) {
 							lines.push("");
-							add(theme.fg("muted", "Your answer:"));
+							addWrapped(theme.fg("muted", "Your answer:"));
 							for (const line of editor.render(Math.max(1, width - 2))) {
-								add(` ${line}`);
+								addRaw(` ${line}`);
 							}
 							lines.push("");
-							add(theme.fg("dim", "Enter submit • Esc back to choices"));
+							addWrapped(theme.fg("dim", "Enter submit • Esc back to choices"));
 						} else {
 							lines.push("");
-							add(theme.fg("dim", "↑↓ navigate • Enter select • Esc cancel"));
+							addWrapped(theme.fg("dim", "↑↓ navigate • Enter select • Esc cancel"));
 						}
 
 						cachedLines = lines;
+						cachedWidth = width;
 						return lines;
 					},
 					invalidate(): void {
 						cachedLines = undefined;
+						cachedWidth = undefined;
 					},
 				};
 			});
 
 			if (!result) {
 				return {
-					content: [{ type: "text", text: "User cancelled the planning question." }],
+					content: [{ type: "text", text: "User cancelled the question." }],
 					details: { question: typed.question, answer: null },
 				};
 			}
 
 			return {
-				content: [{ type: "text", text: `User answered planning question: ${result.answer}` }],
+				content: [{ type: "text", text: `User answered question: ${result.answer}` }],
 				details: { question: typed.question, answer: result.answer, wasCustom: result.wasCustom },
 			};
 		},

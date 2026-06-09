@@ -1,19 +1,24 @@
-import { COLLABORATIVE_PLANNING_GUIDANCE } from "../shared/prompts.ts";
+import { COLLABORATIVE_PLANNING_GUIDANCE, INTERACTIVE_QUESTION_GUIDANCE, WEB_RESEARCH_GUIDANCE } from "../shared/prompts.ts";
 
 export function buildPlanModePrompt(activePlanFile?: string): string {
 	const activePlanLine = activePlanFile
-		? `\nActive plan file: ${activePlanFile}. Revise this same file conceptually by returning the full updated markdown plan document, including a "Changes made:" section that explains what changed. When returning from grooming, incorporate new decisions, assumptions, risks, open questions, and revised implementation steps.`
+		? `\nActive plan file: ${activePlanFile}. Revise this same file conceptually by returning the full updated markdown plan document, including a "Changes made:" section that explains what changed. When returning from brainstorming, incorporate new decisions, assumptions, risks, open questions, and revised implementation steps.`
 		: "\nNo active plan file yet. The extension will save your next complete plan into ./plans/<meaningful-name>.md.";
 
 	return `[PLAN MODE ACTIVE]
-You are in plan mode. This mode is read-only and exists to produce a clear, context-aware implementation plan for achieving the user's task. Do not modify code files or run state-changing commands.
+You are in plan mode. This mode exists to research, brainstorm, and produce a clear, context-aware implementation plan for achieving the user's task. Do not modify code files or intentionally change filesystem, git, package, process, or remote state. You may run research/touch-ground commands through the research gate, including tests, typechecks, linters, version checks, package inspection, and other safe validation commands.
 
 ${COLLABORATIVE_PLANNING_GUIDANCE}
 
+${INTERACTIVE_QUESTION_GUIDANCE}
+
+${WEB_RESEARCH_GUIDANCE}
+
 Before writing a plan:
-- Perform the same research-first brainstorming phase as grooming mode, then continue into the final implementation plan artifact.
+- Perform the same design-thinking loop as brainstorming mode, then continue into the final implementation plan artifact.
 - Safely inspect relevant files, docs, tests, and existing patterns when they matter.
 - Validate the user's proposed architecture against the actual project context.
+- If the request is still at the design-shaping stage, finish clarifying and converging on the design direction before producing implementation steps.
 - Consider or explicitly rule out major alternatives before finalizing the plan; capture the chosen direction and why it won.
 - If key context is missing or there are unresolved open questions, ask clarifying questions instead of emitting a final plan; do not emit a draft plan.
 - Prefer asking questions through the available interactive question tool (\`plan_question\`, \`questionnaire\`, \`question\`, or \`ask_question\`) so answers are collected in an option picker instead of appearing as normal user prompts.
