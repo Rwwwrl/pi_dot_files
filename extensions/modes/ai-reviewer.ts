@@ -1,8 +1,17 @@
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
-import { complete, type Message, type TextContent } from "@earendil-works/pi-ai";
+import type { Message, TextContent } from "@earendil-works/pi-ai";
+import { complete } from "@earendil-works/pi-ai/compat";
 import type { ExtensionContext, SessionEntry } from "@earendil-works/pi-coding-agent";
+import { formatMessagesForReview, truncateForReview } from "./review-context.ts";
 
-interface GateReviewOptions {
+type GateReviewSource = "tool_call" | "user_bash";
+
+interface GateReviewMetadata {
+	source?: GateReviewSource;
+	mode?: string;
+}
+
+interface GateReviewOptions extends GateReviewMetadata {
 	gateName: string;
 	systemPrompt: string;
 	toolName: string;
@@ -10,22 +19,6 @@ interface GateReviewOptions {
 	triageReason: string;
 }
 
-function getMessageText(message: AgentMessage): string {
-	const content = (message as { content?: unknown }).content;
-	if (typeof content === "string") return content;
-	if (!Array.isArray(content)) return "";
-	return content
-		.filter((block): block is TextContent => {
-			return typeof block === "object" && block !== null && (block as { type?: unknown }).type === "text";
-		})
-		.map((block) => block.text)
-		.join("\n");
-}
-
-export function truncateForReview(value: string, maxLength = 4000): string {
-	if (value.length <= maxLength) return value;
-	return `${value.slice(0, maxLength)}\n...[truncated ${value.length - maxLength} chars]`;
-}
 
 function stringifyToolInput(input: Record<string, unknown>): string {
 	try {
@@ -35,16 +28,35 @@ function stringifyToolInput(input: Record<string, unknown>): string {
 	}
 }
 
-function getRecentConversationForReview(ctx: ExtensionContext): string {
+function getBranchConversationForReview(ctx: ExtensionContext): string {
 	const entries = ctx.sessionManager.getBranch();
 	const messages = entries
 		.filter((entry): entry is SessionEntry & { type: "message"; message: AgentMessage } => {
 			return entry.type === "message" && "message" in entry;
 		})
-		.slice(-8)
-		.map((entry) => `${entry.message.role}: ${truncateForReview(getMessageText(entry.message), 1200)}`)
-		.filter((line) => !line.endsWith(": "));
-	return truncateForReview(messages.join("\n\n"), 6000);
+		.map((entry) => entry.message);
+	return formatMessagesForReview(messages);
+}
+
+function getResolvedConversationForReview(ctx: ExtensionContext): string {
+	try {
+		// Mirror Pi's resolved LLM-visible context instead of raw branch entries.
+		// This includes compaction summaries, branch summaries, and custom messages.
+		const sessionManager = ctx.sessionManager as typeof ctx.sessionManager & {
+			buildSessionContext?: () => { messages: AgentMessage[] };
+		};
+		if (!sessionManager.buildSessionContext) return getBranchConversationForReview(ctx);
+		return formatMessagesForReview(sessionManager.buildSessionContext().messages);
+	} catch {
+		return getBranchConversationForReview(ctx);
+	}
+}
+
+function formatReviewMetadata(options: GateReviewOptions): string {
+	const lines = [];
+	if (options.source) lines.push(`Review source: ${options.source}`);
+	if (options.mode) lines.push(`Active mode: ${options.mode}`);
+	return lines.length ? `${lines.join("\n")}\n` : "";
 }
 
 function parseReviewDecision(text: string): { allow: boolean; reason: string } | undefined {
@@ -67,7 +79,7 @@ export async function reviewToolCallWithGate(
 	options: GateReviewOptions,
 ): Promise<{ allow: boolean; reason: string }> {
 	if (!ctx.model) {
-		return { allow: false, reason: `No model is selected, so ${options.gateName} safety review cannot run.` };
+		return { allow: false, reason: `No model is selected, so ${options.gateName} cannot run.` };
 	}
 
 	const auth = await ctx.modelRegistry.getApiKeyAndHeaders(ctx.model);
@@ -80,7 +92,7 @@ export async function reviewToolCallWithGate(
 		content: [
 			{
 				type: "text",
-				text: `Current working directory: ${ctx.cwd}\nTriage reason: ${options.triageReason}\n\nRecent conversation:\n${getRecentConversationForReview(ctx) || "(none)"}\n\nProposed tool call:\nTool: ${options.toolName}\nInput:\n${stringifyToolInput(options.input)}`,
+				text: `Current working directory: ${ctx.cwd}\n${formatReviewMetadata(options)}Triage reason: ${options.triageReason}\n\nResolved conversation context:\n${getResolvedConversationForReview(ctx) || "(none)"}\n\nProposed tool call:\nTool: ${options.toolName}\nInput:\n${stringifyToolInput(options.input)}`,
 			},
 		],
 		timestamp: Date.now(),
@@ -103,41 +115,62 @@ export async function reviewToolCallWithGate(
 	return parseReviewDecision(text) ?? { allow: false, reason: `${options.gateName} safety review returned invalid JSON: ${text}` };
 }
 
-const RESEARCH_REVIEW_SYSTEM_PROMPT = `You are a research-gate security reviewer for a coding agent. Decide whether a proposed tool call is safe research.
+function getAutoreviewerSystemPrompt(): string {
+	return `You are the mode-aware safety autoreviewer for a coding agent. Decide whether a proposed tool call may run without asking the user.
 
 Return strict JSON only: {"allow": true|false, "reason": "short explanation"}.
 
-Policy:
-- Allow inspection, search, reading ordinary files, tests, builds/checks, typechecks, linters, version checks, and package metadata inspection.
-- Allow commands whose main purpose is to learn project state, reproduce a failure, or validate an assumption.
-- Deny intentional filesystem modifications, edit/write tools, dependency installs/removals/updates, git state mutations, commits, pushes, destructive operations, privilege escalation, process killing, remote state mutations, and publishing.
-- Incidental cache or test/build artifacts are acceptable when the command is a normal project validation command and not explicitly writing/changing targeted files.
-- Be conservative: if the call is ambiguous or broader than needed, deny it.`;
+You are given:
+- Active mode
+- Review source
+- Triage reason
+- Resolved conversation context
+- Proposed tool call
 
-const EXECUTION_REVIEW_SYSTEM_PROMPT = `You are an execution-gate security reviewer for a coding agent running in automode. Decide whether a proposed tool call may run without asking the user.
+Mode policy:
+- In normal, inline, research, plan, and brainstorming modes:
+  - Allow only safe research, inspection, and validation.
+  - Allow reading/searching ordinary files, package metadata inspection, version checks, tests, builds/checks, typechecks, and linters that do not intentionally modify files.
+  - Allow bounded interpreter probes such as python -c, python heredocs, node -e, or similar only when the visible code is clearly for inspection, imports, version checks, metadata lookup, or reading project state.
+  - Deny filesystem modifications, edit/write tools, dependency installs/removals/updates, git state mutations, commits, pushes, destructive operations, privilege escalation, process killing, remote state mutations, publishing, long-running services, and unclear side effects.
+  - Incidental cache or test/build artifacts are acceptable when the command is a normal project validation command and not explicitly writing/changing targeted files.
+  - If a call appears to work around a mode-blocked file operation, deny it; mode policy applies to the operation, not just the tool name.
+- In auto mode:
+  - Allow ordinary workspace-scoped edits/writes and task-relevant state changes when they clearly match the user's request.
+  - Allow normal inspection, tests, builds, typechecks, and lint commands.
+  - For package installs, git history mutations, deletions, network downloads, and shell scripts, allow only when clearly necessary, explicitly requested or strongly implied by the task, and reasonably safe.
+  - Deny irreversible destructive operations, privilege escalation, hidden persistence, publishing, force-pushing, unrelated actions, or overly broad/ambiguous changes.
 
-Return strict JSON only: {"allow": true|false, "reason": "short explanation"}.
+Be conservative: if the call is ambiguous or broader than needed, deny it.`;
+}
 
-Policy:
-- Allow ordinary source-code write/edit operations that are scoped to the current workspace and match the user's task.
-- Allow normal inspection, tests, builds, typechecks, and lint commands.
-- Deny irreversible destructive operations, privilege escalation, hidden persistence, publishing, force-pushing, or commands unrelated to the user's task.
-- For package installs, git history mutations, deletions, network downloads, and shell scripts, allow only when clearly necessary, explicitly requested or strongly implied by the task, and reasonably safe.
-- Be conservative: if the call is ambiguous or broader than needed, deny it.`;
+export async function reviewToolCallWithAutoReviewer(
+	ctx: ExtensionContext,
+	toolName: string,
+	input: Record<string, unknown>,
+	triageReason: string,
+	metadata: GateReviewMetadata = {},
+): Promise<{ allow: boolean; reason: string }> {
+	return reviewToolCallWithGate(ctx, {
+		gateName: "Autoreviewer",
+		systemPrompt: getAutoreviewerSystemPrompt(),
+		toolName,
+		input,
+		triageReason,
+		...metadata,
+	});
+}
 
+// Backward-compatible aliases for already-loaded extension code and external imports.
+// Both use the single mode-aware autoreviewer prompt above.
 export async function reviewToolCallWithResearchGate(
 	ctx: ExtensionContext,
 	toolName: string,
 	input: Record<string, unknown>,
 	triageReason: string,
+	metadata: GateReviewMetadata = {},
 ): Promise<{ allow: boolean; reason: string }> {
-	return reviewToolCallWithGate(ctx, {
-		gateName: "Research-gate",
-		systemPrompt: RESEARCH_REVIEW_SYSTEM_PROMPT,
-		toolName,
-		input,
-		triageReason,
-	});
+	return reviewToolCallWithAutoReviewer(ctx, toolName, input, triageReason, metadata);
 }
 
 export async function reviewToolCallWithExecutionGate(
@@ -145,12 +178,7 @@ export async function reviewToolCallWithExecutionGate(
 	toolName: string,
 	input: Record<string, unknown>,
 	triageReason: string,
+	metadata: GateReviewMetadata = {},
 ): Promise<{ allow: boolean; reason: string }> {
-	return reviewToolCallWithGate(ctx, {
-		gateName: "Execution-gate",
-		systemPrompt: EXECUTION_REVIEW_SYSTEM_PROMPT,
-		toolName,
-		input,
-		triageReason,
-	});
+	return reviewToolCallWithAutoReviewer(ctx, toolName, input, triageReason, metadata);
 }

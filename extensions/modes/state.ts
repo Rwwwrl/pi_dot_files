@@ -1,7 +1,8 @@
-export type Mode = "normal" | "research" | "plan" | "brainstorming" | "auto";
+export type Mode = "normal" | "inline" | "research" | "plan" | "brainstorming" | "auto";
 
 const MODE_MARKERS: Array<{ marker: string; mode: Mode }> = [
 	{ marker: "[NORMAL MODE ACTIVE]", mode: "normal" },
+	{ marker: "[INLINE MODE ACTIVE]", mode: "inline" },
 	{ marker: "[RESEARCH MODE ACTIVE]", mode: "research" },
 	{ marker: "[PLAN MODE ACTIVE]", mode: "plan" },
 	{ marker: "[BRAINSTORMING MODE ACTIVE]", mode: "brainstorming" },
@@ -19,7 +20,7 @@ export function setCurrentMode(mode: Mode): void {
 }
 
 export function normalizePersistedMode(value: unknown): Mode | undefined {
-	return ["normal", "research", "plan", "brainstorming", "auto"].includes(value as Mode) ? (value as Mode) : undefined;
+	return ["normal", "inline", "research", "plan", "brainstorming", "auto"].includes(value as Mode) ? (value as Mode) : undefined;
 }
 
 export interface ModeResolutionContext {

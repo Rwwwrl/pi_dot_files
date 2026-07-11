@@ -1,5 +1,6 @@
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
-import { complete, type Message, type TextContent } from "@earendil-works/pi-ai";
+import type { Message, TextContent } from "@earendil-works/pi-ai";
+import { complete } from "@earendil-works/pi-ai/compat";
 import type { ExtensionAPI, ExtensionCommandContext, SessionEntry } from "@earendil-works/pi-coding-agent";
 
 const MAX_CONTEXT_MESSAGES = 30;

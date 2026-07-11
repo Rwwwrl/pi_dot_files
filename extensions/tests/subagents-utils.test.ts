@@ -9,8 +9,10 @@ import {
 	clampConcurrency,
 	createEmptyUsage,
 	getFinalOutput,
+	getModelSpec,
 	getToolCalls,
 	isSubagentParentMode,
+	normalizeSubagentInvocation,
 	shouldMarkSubagentsError,
 	truncateTaskOutput,
 	type SubagentResult,
@@ -44,11 +46,19 @@ describe("subagents utils", () => {
 		assert.equal(childModeNameForParentMode("plan"), "research");
 	});
 
+	it("preserves the parent model and thinking level in the child model spec", () => {
+		const model = { provider: "openai-codex", id: "gpt-test" };
+		assert.equal(getModelSpec(model, "low"), "openai-codex/gpt-test:low");
+		assert.equal(getModelSpec(model, undefined), "openai-codex/gpt-test");
+		assert.equal(getModelSpec(undefined, "high"), undefined);
+	});
+
 	it("allows subagents from research, plan, and brainstorming modes only", () => {
 		assert.equal(isSubagentParentMode("research"), true);
 		assert.equal(isSubagentParentMode("plan"), true);
 		assert.equal(isSubagentParentMode("brainstorming"), true);
 		assert.equal(isSubagentParentMode("normal"), false);
+		assert.equal(isSubagentParentMode("inline"), false);
 		assert.equal(isSubagentParentMode("auto"), false);
 	});
 
@@ -59,8 +69,58 @@ describe("subagents utils", () => {
 		assert.match(prompt, /research-gated tools/);
 		assert.match(prompt, /Bash is available through the research gate/);
 		assert.match(prompt, /Do not intentionally modify files/);
+		assert.match(prompt, /scope, not as permission/);
+		assert.match(prompt, /vague, report the missing scope or context/);
+		assert.match(prompt, /should not blindly trust subagent conclusions/);
 		assert.match(prompt, /Risk scout/);
 		assert.match(prompt, /Find risks/);
+	});
+
+	it("adds divergent ideation guidance for same-problem child agents", () => {
+		const prompt = buildSubagentPrompt("brainstorming", "Find cache-versioning options", "Ideation agent 1", "divergent_ideation");
+		assert.match(prompt, /several isolated agents receiving the same problem statement/);
+		assert.match(prompt, /Do not assume you have been assigned a special angle/);
+		assert.match(prompt, /independently discover and propose candidate solutions/i);
+		assert.match(prompt, /tradeoffs, caveats, risks, assumptions, and open questions/);
+		assert.match(prompt, /Do not choose the final user-facing direction/);
+		assert.match(prompt, /Make conclusions evidence-weighted rather than absolute/);
+	});
+
+	it("normalizes targeted task delegation", () => {
+		const invocation = normalizeSubagentInvocation({
+			tasks: [
+				{ title: " Usage scout ", task: " Find featureA usages " },
+				{ title: "empty", task: "   " },
+			],
+		});
+		assert.equal(invocation.ok, true);
+		if (!invocation.ok) return;
+		assert.equal(invocation.mode, "tasks");
+		assert.deepEqual(invocation.tasks, [{ title: "Usage scout", task: "Find featureA usages", purpose: "delegated_task" }]);
+	});
+
+	it("normalizes divergent ideation with default count", () => {
+		const invocation = normalizeSubagentInvocation({ ideation: { task: " Suggest solutions " } });
+		assert.equal(invocation.ok, true);
+		if (!invocation.ok) return;
+		assert.equal(invocation.mode, "ideation");
+		assert.equal(invocation.tasks.length, 4);
+		assert.equal(invocation.tasks[0].title, "Ideation agent 1");
+		assert.equal(invocation.tasks[0].task, "Suggest solutions");
+		assert.equal(invocation.tasks[0].purpose, "divergent_ideation");
+	});
+
+	it("clamps divergent ideation count to max tasks", () => {
+		const invocation = normalizeSubagentInvocation({ ideation: { title: "Cache options", task: "Suggest solutions", count: 99 } });
+		assert.equal(invocation.ok, true);
+		if (!invocation.ok) return;
+		assert.equal(invocation.tasks.length, 8);
+		assert.equal(invocation.tasks[7].title, "Cache options 8");
+	});
+
+	it("rejects invalid subagent invocation modes", () => {
+		assert.equal(normalizeSubagentInvocation({}).ok, false);
+		assert.equal(normalizeSubagentInvocation({ tasks: [{ task: "Find usages" }], ideation: { task: "Suggest solutions" } }).ok, false);
 	});
 
 	it("clamps concurrency", () => {

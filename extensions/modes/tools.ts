@@ -12,7 +12,7 @@ import {
 	wrapTextWithAnsi,
 } from "@earendil-works/pi-tui";
 
-const PLAN_QUESTION_PARAMETERS = {
+const QUESTION_TOOL_PARAMETERS = {
 	type: "object",
 	properties: {
 		question: { type: "string", description: "The question to ask." },
@@ -41,27 +41,21 @@ const PLAN_QUESTION_PARAMETERS = {
 	additionalProperties: false,
 } as ToolDefinition["parameters"];
 
-interface PlanQuestionParams {
+interface QuestionToolParams {
 	question: string;
 	options: Array<{ label: string; description: string }>;
 }
 
-export function registerPlanQuestionTool(pi: ExtensionAPI): void {
+export function registerQuestionTool(pi: ExtensionAPI): void {
 	pi.registerTool({
-		name: "plan_question",
+		name: "question_tool",
 		label: "Ask Question",
 		description:
 			"Ask the user an interactive question with concrete choices, benefits, caveats, and an optional recommendation.",
 		promptSnippet: "Ask a choice-based user question before proceeding when input is needed",
-		promptGuidelines: [
-			"Use plan_question in any mode where it is available when you need a user decision, confirmation, preference, or missing input before proceeding.",
-			"Do not ask blocking questions only in plain prose unless plan_question or the UI is unavailable.",
-			"For plan_question options, include benefits, caveats, and mark the recommended option when appropriate.",
-			"plan_question always includes an Other/custom option with inline typing, so do not add your own custom option.",
-		],
-		parameters: PLAN_QUESTION_PARAMETERS,
+		parameters: QUESTION_TOOL_PARAMETERS,
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
-			const typed = params as unknown as PlanQuestionParams;
+			const typed = params as unknown as QuestionToolParams;
 			if (!ctx.hasUI) {
 				return {
 					content: [{ type: "text", text: "UI is not available to ask the question." }],

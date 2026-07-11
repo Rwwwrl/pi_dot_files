@@ -14,13 +14,17 @@ import {
 	createEmptyUsage,
 	getResultOutput,
 	getToolCalls,
+	getModelSpec,
 	isFailedResult,
 	isSubagentParentMode,
-	MAX_TASKS,
+	normalizeSubagentInvocation,
 	shouldMarkSubagentsError,
 	truncateTaskOutput,
+	type SubagentInvocationMode,
 	type SubagentParentMode,
+	type SubagentPurpose,
 	type SubagentResult,
+	type SubagentsToolParams,
 } from "./utils.ts";
 
 const SUBAGENTS_PARAMETERS = {
@@ -28,7 +32,8 @@ const SUBAGENTS_PARAMETERS = {
 	properties: {
 		tasks: {
 			type: "array",
-			description: "Independent research/brainstorming tasks to run in parallel subagents.",
+			description:
+				"Targeted research, review, scouting, or decomposition tasks to run in isolated parallel subagents. Use this when the user asks for specific delegated work.",
 			items: {
 				type: "object",
 				properties: {
@@ -39,22 +44,29 @@ const SUBAGENTS_PARAMETERS = {
 				additionalProperties: false,
 			},
 		},
+		ideation: {
+			type: "object",
+			description:
+				"Divergent brainstorming mode: run several isolated agents on the same neutral problem statement for open-ended solution discovery.",
+			properties: {
+				title: { type: "string", description: "Optional base display title for the generated ideation agents." },
+				task: { type: "string", description: "The neutral problem statement every ideation agent should receive." },
+				count: { type: "number", description: "Number of ideation agents to run. Defaults to 4; capped at 8." },
+			},
+			required: ["task"],
+			additionalProperties: false,
+		},
 		maxConcurrency: {
 			type: "number",
 			description: "Maximum number of child agents to run at once. Defaults to 4; capped at 4.",
 		},
 	},
-	required: ["tasks"],
 	additionalProperties: false,
 } as ToolDefinition["parameters"];
 
-interface SubagentsParams {
-	tasks: Array<{ title?: string; task: string }>;
-	maxConcurrency?: number;
-}
-
 interface SubagentsDetails {
 	parentMode: SubagentParentMode;
+	invocationMode?: SubagentInvocationMode;
 	childTools: string[];
 	results: SubagentResult[];
 }
@@ -92,11 +104,6 @@ function buildChildArgs(mode: SubagentParentMode, prompt: string, modelSpec: str
 	return args;
 }
 
-function getModelSpec(ctxModel: { provider: string; id: string } | undefined, thinkingLevel: string | undefined): string | undefined {
-	if (!ctxModel) return undefined;
-	return thinkingLevel ? `${ctxModel.provider}/${ctxModel.id}:${thinkingLevel}` : `${ctxModel.provider}/${ctxModel.id}`;
-}
-
 async function mapWithConcurrencyLimit<TIn, TOut>(
 	items: TIn[],
 	concurrency: number,
@@ -122,6 +129,7 @@ async function runSubagent(options: {
 	index: number;
 	title?: string;
 	task: string;
+	purpose: SubagentPurpose;
 	parentMode: SubagentParentMode;
 	cwd: string;
 	modelSpec?: string;
@@ -139,7 +147,7 @@ async function runSubagent(options: {
 		stderr: "",
 		usage: createEmptyUsage(),
 	};
-	const prompt = buildSubagentPrompt(options.parentMode, options.task, options.title);
+	const prompt = buildSubagentPrompt(options.parentMode, options.task, options.title, options.purpose);
 	const args = buildChildArgs(options.parentMode, prompt, options.modelSpec);
 
 	if (options.signal?.aborted) {
@@ -248,11 +256,13 @@ export default function subagentsExtension(pi: ExtensionAPI): void {
 		name: "subagents",
 		label: "Subagents",
 		description:
-			"Run multiple isolated read-only subagents in parallel for project research, brainstorming, or internet/documentation research. Available in research, plan, and brainstorming modes.",
-		promptSnippet: "Run multiple isolated read-only subagents in parallel and synthesize their findings",
+			"Run isolated read-only subagents in parallel for targeted delegation or divergent ideation. Available in research, plan, and brainstorming modes.",
+		promptSnippet: "Run isolated read-only subagents for targeted tasks or same-problem divergent ideation",
 		promptGuidelines: [
-			"Use subagents when independent project research, feature brainstorming, or internet/documentation research can run in parallel before synthesizing an answer.",
-			"Use subagents only for independent tasks; the parent agent remains responsible for final synthesis and decisions.",
+			"Use subagents.tasks for targeted research, review, scouting, decomposition, or internet/documentation research when the user asks for specific delegated work.",
+			"Use subagents.ideation for open-ended solution discovery in brainstorming mode: run several isolated agents on the same neutral problem statement before synthesizing options.",
+			"Do not force subagents.ideation for every brainstorming request; preserve subagents.tasks when the user asks to spin an agent for a specific research or safety-check task.",
+			"For subagents.ideation, do not preselect approaches or assign solution categories; let each child independently discover possible options, then synthesize overlaps, disagreements, caveats, risks, and open questions.",
 			"Subagents run child research/brainstorming modes with research-gated bash for inspection and validation; do not use subagents for implementation work.",
 		],
 		parameters: SUBAGENTS_PARAMETERS,
@@ -267,27 +277,17 @@ export default function subagentsExtension(pi: ExtensionAPI): void {
 				};
 			}
 
-			const typed = params as unknown as SubagentsParams;
-			const tasks = typed.tasks
-				.map((task) => ({ title: task.title?.trim() || undefined, task: task.task.trim() }))
-				.filter((task) => task.task.length > 0);
-
-			if (tasks.length === 0) {
+			const typed = params as unknown as SubagentsToolParams;
+			const invocation = normalizeSubagentInvocation(typed);
+			if (!invocation.ok) {
 				return {
-					content: [{ type: "text", text: "No non-empty subagent tasks were provided." }],
+					content: [{ type: "text", text: invocation.error }],
 					details: { parentMode: mode, childTools: [...CHILD_TOOL_NAMES], results: [] },
 					isError: true,
 				};
 			}
 
-			if (tasks.length > MAX_TASKS) {
-				return {
-					content: [{ type: "text", text: `Too many subagent tasks (${tasks.length}). Maximum is ${MAX_TASKS}.` }],
-					details: { parentMode: mode, childTools: [...CHILD_TOOL_NAMES], results: [] },
-					isError: true,
-				};
-			}
-
+			const tasks = invocation.tasks;
 			const results: SubagentResult[] = tasks.map((task, index) => ({
 				index,
 				title: task.title,
@@ -299,7 +299,12 @@ export default function subagentsExtension(pi: ExtensionAPI): void {
 				stderr: "",
 				usage: createEmptyUsage(),
 			}));
-			const details = (): SubagentsDetails => ({ parentMode: mode, childTools: [...CHILD_TOOL_NAMES], results: [...results] });
+			const details = (): SubagentsDetails => ({
+				parentMode: mode,
+				invocationMode: invocation.mode,
+				childTools: [...CHILD_TOOL_NAMES],
+				results: [...results],
+			});
 			const emitUpdate = () => {
 				(onUpdate as OnUpdate)?.({ content: [{ type: "text", text: buildStatusText(results) }], details: details() });
 			};
@@ -315,6 +320,7 @@ export default function subagentsExtension(pi: ExtensionAPI): void {
 						index,
 						title: task.title,
 						task: task.task,
+						purpose: task.purpose,
 						parentMode: mode,
 						cwd: ctx.cwd,
 						modelSpec,
@@ -340,12 +346,25 @@ export default function subagentsExtension(pi: ExtensionAPI): void {
 			const hasFailures = shouldMarkSubagentsError(finalResults);
 			return {
 				content: [{ type: "text", text: summarizeForModel(finalResults) }],
-				details: { parentMode: mode, childTools: [...CHILD_TOOL_NAMES], results: finalResults },
+				details: { parentMode: mode, invocationMode: invocation.mode, childTools: [...CHILD_TOOL_NAMES], results: finalResults },
 				isError: hasFailures,
 			};
 		},
 		renderCall(args, theme) {
-			const typedArgs = args as SubagentsParams;
+			const typedArgs = args as SubagentsToolParams;
+			if (typedArgs.ideation) {
+				const rawCount =
+					typeof typedArgs.ideation.count === "number" && Number.isFinite(typedArgs.ideation.count)
+						? Math.trunc(typedArgs.ideation.count)
+						: 4;
+				const count = Math.max(1, Math.min(8, rawCount));
+				return new Text(
+					theme.fg("toolTitle", theme.bold("subagents ")) +
+						theme.fg("accent", `ideation ${count} agent${count === 1 ? "" : "s"}`),
+					0,
+					0,
+				);
+			}
 			const count = Array.isArray(typedArgs.tasks) ? typedArgs.tasks.length : 0;
 			return new Text(theme.fg("toolTitle", theme.bold("subagents ")) + theme.fg("accent", `${count} task${count === 1 ? "" : "s"}`), 0, 0);
 		},

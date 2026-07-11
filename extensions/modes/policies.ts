@@ -1,5 +1,6 @@
 import { resolve } from "node:path";
 import { evaluatePublicHttpUrl } from "../shared/web-policies.ts";
+import { getRegisteredMcpToolPolicy, isRegisteredMcpTool } from "../mcp/registry.ts";
 
 export type SafetyDecision = "allow" | "deny" | "review";
 export type PathAccess = "read" | "write";
@@ -27,6 +28,7 @@ export const READ_ONLY_COMMAND_PATTERNS: RegExp[] = [
 	/^\s*tail\b/,
 	/^\s*less\b/,
 	/^\s*more\b/,
+	/^\s*nl\b/,
 	/^\s*grep\b/,
 	/^\s*find\b/,
 	/^\s*ls\b/,
@@ -222,6 +224,16 @@ function hasRootOrHomeTarget(tokens: ShellToken[]): boolean {
 	});
 }
 
+function isDevNullOutputRedirection(command: string, redirectionIndex: number): boolean {
+	let targetStart = redirectionIndex + 1;
+	if (command[targetStart] === ">") targetStart++;
+	while (/\s/.test(command[targetStart] ?? "")) targetStart++;
+	const targetEnd = targetStart + "/dev/null".length;
+	if (command.slice(targetStart, targetEnd) !== "/dev/null") return false;
+	const next = command[targetEnd];
+	return next === undefined || /\s/.test(next);
+}
+
 function hasUnquotedOutputRedirection(command: string): boolean {
 	let quote: "single" | "double" | undefined;
 	let escaped = false;
@@ -252,7 +264,7 @@ function hasUnquotedOutputRedirection(command: string): boolean {
 			quote = "double";
 			continue;
 		}
-		if (char === ">") return true;
+		if (char === ">" && !isDevNullOutputRedirection(command, index)) return true;
 	}
 
 	return false;
@@ -553,6 +565,28 @@ function classifyPublicHttpUrl(rawUrl: unknown): SafetyClassification {
 	return { decision: "deny", reason: `web_fetch ${evaluation.reason}` };
 }
 
+function classifyMcpToolCall(toolName: string, toolPolicy: ToolClassificationPolicy): SafetyClassification {
+	const metadata = getRegisteredMcpToolPolicy(toolName);
+	const annotations = metadata?.annotations;
+
+	if (annotations?.readOnlyHint === true && annotations.destructiveHint !== true) {
+		return { decision: "allow", reason: "MCP tool declares read-only behavior" };
+	}
+
+	if (annotations?.destructiveHint === true) {
+		if (toolPolicy.writeDecision === "deny") {
+			return { decision: "deny", reason: "MCP tool declares destructive behavior" };
+		}
+		return { decision: "review", reason: "MCP tool declares destructive behavior" };
+	}
+
+	if (annotations?.openWorldHint === true) {
+		return { decision: "review", reason: "MCP tool can access open-world external state" };
+	}
+
+	return { decision: "review", reason: "MCP tool lacks read-only safety metadata" };
+}
+
 export function classifyPathAccess(path: string, cwd?: string, access: PathAccess = "read"): SafetyClassification {
 	if (access === "write" && cwd) {
 		const workspace = resolve(cwd);
@@ -623,7 +657,7 @@ export function classifyToolCallWithPolicy(
 	bashPolicy: BashClassificationPolicy,
 	toolPolicy: ToolClassificationPolicy,
 ): SafetyClassification {
-	if (["plan_question", "questionnaire", "question", "ask_question"].includes(toolName)) {
+	if (["question_tool", "questionnaire", "question", "ask_question"].includes(toolName)) {
 		return { decision: "allow", reason: "user-interaction tool" };
 	}
 
@@ -655,6 +689,8 @@ export function classifyToolCallWithPolicy(
 		return classifyPathAccess(path, cwd, "write");
 	}
 
+	if (isRegisteredMcpTool(toolName)) return classifyMcpToolCall(toolName, toolPolicy);
+
 	return { decision: "review", reason: toolPolicy.unknownReason(toolName) };
 }
 
@@ -666,8 +702,8 @@ const RESEARCH_BASH_POLICY: BashClassificationPolicy = {
 
 const RESEARCH_TOOL_POLICY: ToolClassificationPolicy = {
 	writeDecision: "deny",
-	writeDeniedReason: (toolName) => `${toolName} intentionally modifies files and is not allowed by the research gate`,
-	unknownReason: (toolName) => `unknown tool ${toolName} requires research-gate review`,
+	writeDeniedReason: (toolName) => `${toolName} intentionally modifies files and is not allowed by the read-only mode policy`,
+	unknownReason: (toolName) => `unknown tool ${toolName} requires mode-aware autoreviewer`,
 };
 
 const EXECUTION_BASH_POLICY: BashClassificationPolicy = {
@@ -679,7 +715,7 @@ const EXECUTION_BASH_POLICY: BashClassificationPolicy = {
 const EXECUTION_TOOL_POLICY: ToolClassificationPolicy = {
 	writeDecision: "classify-path",
 	writeDeniedReason: (toolName) => `${toolName} intentionally modifies files`,
-	unknownReason: (toolName) => `unknown tool ${toolName} requires execution-gate review`,
+	unknownReason: (toolName) => `unknown tool ${toolName} requires mode-aware autoreviewer`,
 };
 
 export function classifyResearchBashCommand(command: string): SafetyClassification {
@@ -707,14 +743,5 @@ export function classifyExecutionToolCall(toolName: string, input: Record<string
 }
 
 export function classifyNormalBashCommand(command: string): SafetyClassification {
-	const trimmed = command.trim();
-	if (!trimmed) return { decision: "allow", reason: "empty command" };
-
-	const strictlyBlockedReason = findStrictlyBlockedCommandReason(trimmed);
-	if (strictlyBlockedReason) return { decision: "deny", reason: strictlyBlockedReason };
-
-	const researchClassification = classifyResearchBashCommand(trimmed);
-	if (researchClassification.decision === "allow") return researchClassification;
-
-	return { decision: "review", reason: researchClassification.reason };
+	return classifyResearchBashCommand(command);
 }

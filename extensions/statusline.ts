@@ -1,5 +1,7 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
+import { colorizeMode, parseMode } from "./modes/colors.ts";
+import type { Mode } from "./modes/state.ts";
 
 function formatCwd(cwd: string): string {
 	const home = process.env.HOME;
@@ -19,13 +21,13 @@ function stripAnsi(value: string): string {
 	return value.replace(/\x1B\[[0-?]*[ -/]*[@-~]/g, "");
 }
 
-function extractMode(status?: string): string | undefined {
+function extractMode(status?: string): Mode | undefined {
 	if (!status) return undefined;
 	const plain = stripAnsi(status)
 		.replace(/^mode:\s*/i, "")
 		.split("|")[0]
 		.trim();
-	return plain || undefined;
+	return parseMode(plain);
 }
 
 function getPriorityStatuses(statuses: ReadonlyMap<string, string>): Array<{ key: string; text: string }> {
@@ -71,10 +73,6 @@ function renderInline(left: string, right: string, width: number): string {
 	return truncateToWidth(`${leftText}${" ".repeat(gap)}${rightText}`, width, "");
 }
 
-function modeColor(mode: string): "success" | "muted" | "warning" {
-	return mode === "auto" ? "success" : mode === "normal" ? "muted" : "warning";
-}
-
 export default function statuslineExtension(pi: ExtensionAPI): void {
 	let requestRender: (() => void) | undefined;
 
@@ -106,23 +104,26 @@ export default function statuslineExtension(pi: ExtensionAPI): void {
 					const mode = extractMode(statuses.get("mode"));
 
 					const extraStatuses = getPriorityStatuses(statuses).map(({ text }) => text);
-					const leftParts = [
+					const projectParts = [
 						theme.fg("dim", formatCwd(ctx.cwd)),
 						branch ? theme.fg("muted", ` ${branch}`) : undefined,
-						mode ? theme.fg(modeColor(mode), mode) : undefined,
-						...extraStatuses,
 					].filter((part): part is string => Boolean(part));
+					const modeParts = [mode ? colorizeMode(mode) : undefined, ...extraStatuses].filter(
+						(part): part is string => Boolean(part),
+					);
 
 					const model = ctx.model?.id ?? "no-model";
 					const effort = pi.getThinkingLevel();
-					const rightParts = [
-						theme.fg("dim", `${model} · ${effort}`),
-						theme.fg("dim", formatContext(ctx)),
-					];
-
 					const innerWidth = Math.max(0, width - 2);
-					const line = renderInline(leftParts.join(" "), rightParts.join(" "), innerWidth);
-					return [width <= 1 ? " ".slice(0, width) : ` ${line} `];
+					const projectLine = renderInline(projectParts.join(" "), "", innerWidth);
+					const modeLine = renderInline(
+						modeParts.join(" "),
+						[theme.fg("dim", `${model} · ${effort}`), theme.fg("dim", formatContext(ctx))].join(" "),
+						innerWidth,
+					);
+
+					if (width <= 1) return [" ".slice(0, width), " ".slice(0, width)];
+					return [` ${projectLine} `, ` ${modeLine} `];
 				},
 			};
 		});

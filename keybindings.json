@@ -1,3 +1,6 @@
 {
-  "app.thinking.cycle": []
+  "app.thinking.cycle": [],
+  "tui.editor.deleteToLineEnd": [],
+  "tui.input.newLine": ["shift+enter"],
+  "app.editor.external": ["ctrl+g", "ctrl+shift+g"]
 }

@@ -13,8 +13,12 @@ function formatPercent(value: number | null | undefined): string {
 	return typeof value === "number" && Number.isFinite(value) ? `${Math.round(value)}%` : "unknown";
 }
 
-function formatChars(value: number): string {
-	return `${nf.format(value)} chars`;
+function estimateTextTokens(text: string): number {
+	return Math.ceil(text.length / 4);
+}
+
+function formatTextTokens(text: string): string {
+	return `${nf.format(estimateTextTokens(text))} tokens`;
 }
 
 function makeBar(percent: number | null | undefined): string {
@@ -80,7 +84,7 @@ function buildContextReport(ctx: ExtensionCommandContext, activeTools: string[])
 		`Context window: ${formatNumber(usage?.contextWindow)} tokens`,
 		`Used: ${formatNumber(usage?.tokens)} tokens`,
 		`Remaining: ${formatNumber(remaining)} tokens`,
-		`System prompt: ${formatChars(systemPrompt.length)}`,
+		`System prompt: ${formatTextTokens(systemPrompt)}`,
 		"",
 		`Session: ${ctx.sessionManager.getSessionFile() ?? "ephemeral"}`,
 		`Branch entries: ${nf.format(branch.length)} / ${nf.format(entries.length)} total`,
@@ -96,7 +100,7 @@ function buildContextReport(ctx: ExtensionCommandContext, activeTools: string[])
 		lines.push("  none");
 	} else {
 		for (const file of formatList(
-			contextFiles.map((file) => `${file.path} (${formatChars(file.content.length)})`),
+			contextFiles.map((file) => `${file.path} (${formatTextTokens(file.content)})`),
 			MAX_CONTEXT_FILES,
 		)) {
 			lines.push(`  ${file}`);

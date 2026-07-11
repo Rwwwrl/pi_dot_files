@@ -1,5 +1,4 @@
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { classifyNormalBashCommand } from "./policies.ts";
 
 function truncateApprovalText(value: string, maxLength = 4000): string {
 	if (value.length <= maxLength) return value;
@@ -37,15 +36,6 @@ export async function approveNormalToolCall(
 		ctx,
 		"Approve tool call?",
 		`Normal mode requires your approval before running ${toolName}.\n\nInput:\n${stringifyToolInput(input)}`,
-	);
-}
-
-export async function approveNormalBashCommand(ctx: ExtensionContext, command: string): Promise<boolean> {
-	const classification = classifyNormalBashCommand(command);
-	return requestNormalApproval(
-		ctx,
-		"Approve shell command?",
-		`Normal mode requires your explicit approval before this shell command can run.\n\nReason: ${classification.reason}\n\nCommand:\n${command}`,
 	);
 }
 

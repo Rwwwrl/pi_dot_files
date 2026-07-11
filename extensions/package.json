@@ -9,5 +9,8 @@
   "devDependencies": {
     "@types/node": "latest",
     "typescript": "latest"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.29.0"
   }
 }

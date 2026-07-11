@@ -10,6 +10,7 @@ import {
 	isGitPushForceWithLeaseCommand,
 	isResearchCommandAllowed,
 } from "../modes/policies.ts";
+import { handleModeToolCall, handleModeUserBash, isTrustedSubagentsTool } from "../modes/services.ts";
 import { resolveCurrentMode, setCurrentMode } from "../modes/state.ts";
 import { validatePublicHttpUrl } from "../shared/web-policies.ts";
 
@@ -20,8 +21,11 @@ describe("research gate", () => {
 		"rg rm src",
 		"rg \"touch\" src",
 		"rg \"a > b\" src",
+		"rg foo src 2>/dev/null",
+		"rg foo src 2> /dev/null",
 		"grep \"git commit\" file",
 		"grep -R foo .",
+		"nl -ba tmp.py",
 		"git status --short",
 		"git diff -- modes/policies.ts",
 		"npm audit --json",
@@ -69,6 +73,10 @@ describe("research gate", () => {
 		"touch file.txt",
 		"sed -i '' 's/a/b/' file.txt",
 		"echo hello > file.txt",
+		"rg foo src 2> errors.txt",
+		"rg foo src 2>/dev/nullfile",
+		"rg foo src 2>/dev/null > matches.txt",
+		"nl -ba tmp.py > numbered.txt",
 		"rg foo | tee matches.txt",
 		"rg foo && rm -rf tmp",
 		"rg foo; touch x",
@@ -123,6 +131,7 @@ describe("research gate", () => {
 		assert.equal(classifyResearchToolCall("grep", { path: ".ssh/id_rsa", pattern: "x" }).decision, "allow");
 		assert.equal(classifyResearchToolCall("web_research", { query: "zod docs" }).decision, "allow");
 		assert.equal(classifyResearchToolCall("web_fetch", { url: "https://zod.dev" }).decision, "allow");
+		assert.equal(classifyResearchToolCall("question_tool", { question: "Proceed?", options: [] }).decision, "allow");
 		assert.equal(classifyResearchToolCall("edit", { path: "src/index.ts" }).decision, "deny");
 	});
 
@@ -158,6 +167,7 @@ describe("execution gate", () => {
 	it("classifies web research tools", () => {
 		assert.equal(classifyExecutionToolCall("web_research", { query: "zod docs" }).decision, "allow");
 		assert.equal(classifyExecutionToolCall("web_fetch", { url: "https://zod.dev" }).decision, "allow");
+		assert.equal(classifyExecutionToolCall("question_tool", { question: "Proceed?", options: [] }).decision, "allow");
 		assert.notEqual(classifyExecutionToolCall("web_fetch", { url: "http://localhost:3000" }).decision, "allow");
 	});
 
@@ -165,14 +175,15 @@ describe("execution gate", () => {
 		assert.equal(classifyExecutionBashCommand("sudo rm -rf /").decision, "deny");
 	});
 
-	it("keeps plain force-push denied while reviewing force-with-lease", () => {
+	it("keeps plain force-push denied while reviewing force-with-lease in execution mode", () => {
 		assert.equal(classifyExecutionBashCommand("git push --force origin HEAD").decision, "deny");
 		assert.equal(classifyExecutionBashCommand("git push -f origin HEAD").decision, "deny");
 		assert.equal(classifyExecutionBashCommand("git push -fu origin HEAD").decision, "deny");
 		assert.equal(classifyExecutionBashCommand("git push --force-with-lease -u origin HEAD").decision, "review");
-		assert.equal(classifyNormalBashCommand("git push --force-with-lease -u origin HEAD").decision, "review");
+		assert.equal(classifyNormalBashCommand("git push --force-with-lease -u origin HEAD").decision, "deny");
 		assert.equal(isGitPushForceWithLeaseCommand("git push --force-with-lease -u origin HEAD"), true);
 		assert.equal(isGitPushForceWithLeaseCommand("git push --force-with-lease -u origin HEAD && rm temp.txt"), false);
+		assert.equal(classifyExecutionBashCommand("python -c 'import django'").decision, "review");
 	});
 
 	it("reviews destructive or ambiguous execution commands", () => {
@@ -187,10 +198,158 @@ describe("execution gate", () => {
 	});
 });
 
+describe("mode tool-call router", () => {
+	const ctx = { cwd: "/workspace/project", hasUI: false } as any;
+
+	it("recognizes only SDK or user-scoped subagents as trusted", () => {
+		assert.equal(isTrustedSubagentsTool({ name: "subagents", sourceInfo: { source: "sdk", scope: "temporary" } }), true);
+		assert.equal(isTrustedSubagentsTool({ name: "subagents", sourceInfo: { source: "extension", scope: "user" } }), true);
+		assert.equal(isTrustedSubagentsTool({ name: "subagents", sourceInfo: { source: "extension", scope: "project" } }), false);
+		assert.equal(isTrustedSubagentsTool({ name: "other", sourceInfo: { source: "sdk", scope: "temporary" } }), false);
+	});
+
+	it("bypasses autoreview only for trusted subagents in research-like modes", async () => {
+		const trustedReadOnlyTools = new Set(["subagents"]);
+		for (const mode of ["research", "plan", "brainstorming"] as const) {
+			const trusted = await handleModeToolCall(
+				mode,
+				{ type: "tool_call", toolCallId: mode, toolName: "subagents", input: { tasks: [{ task: "Inspect" }] } } as any,
+				ctx,
+				{ trustedReadOnlyTools },
+			);
+			assert.equal(trusted, undefined);
+		}
+
+		const untrusted = await handleModeToolCall(
+			"research",
+			{ type: "tool_call", toolCallId: "untrusted", toolName: "subagents", input: { tasks: [{ task: "Inspect" }] } } as any,
+			ctx,
+		);
+		assert.equal(untrusted?.block, true);
+		assert.match(untrusted?.reason ?? "", /autoreviewer blocked subagents/i);
+	});
+
+	it("does not apply the trusted research bypass in normal, inline, or auto mode", async () => {
+		const trustedReadOnlyTools = new Set(["subagents"]);
+		for (const mode of ["normal", "inline", "auto"] as const) {
+			const result = await handleModeToolCall(
+				mode,
+				{ type: "tool_call", toolCallId: mode, toolName: "subagents", input: { tasks: [{ task: "Inspect" }] } } as any,
+				ctx,
+				{ trustedReadOnlyTools },
+			);
+			assert.equal(result?.block, true);
+		}
+	});
+
+	it("continues to review ordinary unknown tools", async () => {
+		const result = await handleModeToolCall(
+			"research",
+			{ type: "tool_call", toolCallId: "unknown", toolName: "unknown_tool", input: {} } as any,
+			ctx,
+			{ trustedReadOnlyTools: new Set(["subagents"]) },
+		);
+		assert.equal(result?.block, true);
+		assert.match(result?.reason ?? "", /autoreviewer blocked unknown_tool/i);
+	});
+
+	it("requires inline approval for write instead of hard-blocking it", async () => {
+		const result = await handleModeToolCall(
+			"inline",
+			{ type: "tool_call", toolCallId: "1", toolName: "write", input: { path: "src/index.ts", content: "" } } as any,
+			ctx,
+		);
+
+		assert.equal(result?.block, true);
+		assert.match(result?.reason ?? "", /inline mode requires user approval before write/);
+		assert.doesNotMatch(result?.reason ?? "", /does not allow creating or replacing files/);
+		assert.doesNotMatch(result?.reason ?? "", /not available/);
+	});
+
+	it("requires normal and inline approval for edit", async () => {
+		for (const mode of ["normal", "inline"] as const) {
+			const result = await handleModeToolCall(
+				mode,
+				{ type: "tool_call", toolCallId: mode, toolName: "edit", input: { path: "src/index.ts", oldText: "a", newText: "b" } } as any,
+				ctx,
+			);
+
+			assert.equal(result?.block, true);
+			assert.match(result?.reason ?? "", new RegExp(`${mode} mode requires user approval before edit`));
+		}
+	});
+
+	it("routes normal and inline ambiguous bash through the mode-aware autoreviewer", async () => {
+		for (const mode of ["normal", "inline"] as const) {
+			const result = await handleModeToolCall(
+				mode,
+				{ type: "tool_call", toolCallId: mode, toolName: "bash", input: { command: "python -c 'import django'" } } as any,
+				ctx,
+			);
+
+			assert.equal(result?.block, true);
+			assert.match(result?.reason ?? "", /autoreviewer blocked shell command/i);
+			assert.doesNotMatch(result?.reason ?? "", /requires explicit user approval/);
+		}
+	});
+
+	it("routes normal and inline ambiguous user bash through the mode-aware autoreviewer", async () => {
+		for (const mode of ["normal", "inline"] as const) {
+			const result = await handleModeUserBash(
+				mode,
+				{ type: "user_bash", command: "python -c 'import django'" } as any,
+				ctx,
+			);
+
+			assert.equal(result?.result?.exitCode, 1);
+			assert.match(result?.result?.output ?? "", /autoreviewer blocked shell command/i);
+			assert.doesNotMatch(result?.result?.output ?? "", /requires explicit user approval/);
+		}
+	});
+
+	it("blocks normal and inline state-changing bash directly", async () => {
+		for (const mode of ["normal", "inline"] as const) {
+			const result = await handleModeToolCall(
+				mode,
+				{ type: "tool_call", toolCallId: mode, toolName: "bash", input: { command: "touch file.txt" } } as any,
+				ctx,
+			);
+
+			assert.equal(result?.block, true);
+			assert.match(result?.reason ?? "", new RegExp(`${mode} mode blocked shell command`));
+			assert.doesNotMatch(result?.reason ?? "", /autoreviewer|approval/i);
+		}
+	});
+
+	it("routes research-like modes through the mode-aware autoreviewer after triage", async () => {
+		for (const mode of ["research", "plan", "brainstorming"] as const) {
+			const result = await handleModeToolCall(
+				mode,
+				{ type: "tool_call", toolCallId: mode, toolName: "edit", input: { path: "src/index.ts", oldText: "a", newText: "b" } } as any,
+				ctx,
+			);
+
+			assert.equal(result?.block, true);
+			assert.match(result?.reason ?? "", new RegExp(`${mode} mode blocked edit`));
+		}
+	});
+
+	it("routes auto mode through the execution policy", async () => {
+		const result = await handleModeToolCall(
+			"auto",
+			{ type: "tool_call", toolCallId: "1", toolName: "edit", input: { path: "src/index.ts", oldText: "a", newText: "b" } } as any,
+			ctx,
+		);
+
+		assert.equal(result, undefined);
+	});
+});
+
 describe("mode state resolution", () => {
 	it("prefers active system-prompt markers over singleton state", () => {
 		setCurrentMode("normal");
 		assert.equal(resolveCurrentMode({ getSystemPrompt: () => "[RESEARCH MODE ACTIVE]" }), "research");
+		assert.equal(resolveCurrentMode({ getSystemPrompt: () => "[INLINE MODE ACTIVE]" }), "inline");
 	});
 
 	it("falls back to persisted session mode before singleton state", () => {
@@ -203,6 +362,14 @@ describe("mode state resolution", () => {
 			}),
 			"brainstorming",
 		);
+		assert.equal(
+			resolveCurrentMode({
+				sessionManager: {
+					getBranch: () => [{ type: "custom", customType: "modes", data: { mode: "inline" } }],
+				},
+			}),
+			"inline",
+		);
 	});
 });
 
@@ -212,8 +379,8 @@ describe("normal mode command policy", () => {
 		assert.equal(classifyNormalBashCommand("npm test").decision, "allow");
 	});
 
-	it("reviews changing commands and avoids quoted/search-text false positives", () => {
-		assert.equal(classifyNormalBashCommand("git commit -m test").decision, "review");
+	it("denies changing commands and avoids quoted/search-text false positives", () => {
+		assert.equal(classifyNormalBashCommand("git commit -m test").decision, "deny");
 		assert.equal(classifyNormalBashCommand("rg TOKEN .env").decision, "allow");
 		assert.equal(classifyNormalBashCommand("rg sudo .").decision, "allow");
 		assert.equal(classifyNormalBashCommand("grep \"git push\" README.md").decision, "allow");
@@ -229,9 +396,11 @@ describe("normal mode command policy", () => {
 		assert.notEqual(classifyNormalBashCommand("ls\ntouch owned.txt").decision, "allow");
 	});
 
-	it("reviews commands outside normal allowlist and research gate", () => {
+	it("reviews ambiguous research commands and denies state-changing commands", () => {
 		assert.equal(classifyNormalBashCommand("python script.py").decision, "review");
-		assert.equal(classifyNormalBashCommand("touch file.txt").decision, "review");
-		assert.equal(classifyNormalBashCommand("pip install requests").decision, "review");
+		assert.equal(classifyNormalBashCommand("python -c 'import django'").decision, "review");
+		assert.equal(classifyNormalBashCommand("touch file.txt").decision, "deny");
+		assert.equal(classifyNormalBashCommand("pip install requests").decision, "deny");
+		assert.equal(classifyNormalBashCommand("git commit -m test").decision, "deny");
 	});
 });
